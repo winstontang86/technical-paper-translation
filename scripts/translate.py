@@ -55,6 +55,28 @@ def _filter_glossary_for_text(glossary: Dict[str, str], text: str) -> List[str]:
     return lines
 
 
+def _assign_waves(units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """为每个翻译单元注入 wave 字段，用于外部执行器并行调度。
+
+    规则：
+    - is_reference=True：wave=-1（不翻译）。
+    - 同一 section_heading 内的单元必须串行（因为后面的 previous_zh 依赖前面）：
+      在同一 section 内按顺序 wave 递增。
+    - 不同 section 之间同一 wave 可并行：某个 wave 可包含多个不同 section 的单元。
+    - 同 wave 内的单元彼此没有 previous_zh 依赖，可安全并发翻译。
+    """
+    section_idx: Dict[str, int] = {}
+    for unit in units:
+        if unit.get("is_reference"):
+            unit["wave"] = -1
+            continue
+        heading = unit.get("section_heading", "")
+        idx = section_idx.get(heading, 0)
+        unit["wave"] = idx
+        section_idx[heading] = idx + 1
+    return units
+
+
 def _segment_to_unit(seg: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": seg["id"],
@@ -230,6 +252,7 @@ def generate(segments_path: Path, outdir: Path, glossary: Dict[str, str],
              unit_mode: str = "segment", hybrid_max_chars: int = HYBRID_MAX_CHARS) -> None:
     segments: List[Dict[str, Any]] = json.loads(segments_path.read_text(encoding="utf-8"))
     units = build_translation_units(segments, unit_mode=unit_mode, hybrid_max_chars=hybrid_max_chars)
+    units = _assign_waves(units)
     (outdir / "translation_units.json").write_text(
         json.dumps(units, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -238,6 +261,13 @@ def generate(segments_path: Path, outdir: Path, glossary: Dict[str, str],
     zh_dir = outdir / "zh_per_segment"
     prompts_dir.mkdir(parents=True, exist_ok=True)
     zh_dir.mkdir(parents=True, exist_ok=True)
+
+    # 统计 wave 分布供索引展示
+    from collections import Counter
+    wave_counter: Counter = Counter(u["wave"] for u in units if u.get("wave", -1) >= 0)
+    max_wave = max(wave_counter.keys()) if wave_counter else -1
+    total_translatable = sum(wave_counter.values())
+    max_parallel = max(wave_counter.values()) if wave_counter else 0
 
     index_lines = [
         "# 翻译任务索引",
@@ -251,24 +281,39 @@ def generate(segments_path: Path, outdir: Path, glossary: Dict[str, str],
         "  2. 将 `# SYSTEM` 部分作为 system prompt；将 `# USER` 部分作为 user message。若宿主平台不支持 system 角色，可把 system 内容放在 user message 开头。",
         "  3. 将 LLM 输出的中文译文写入 `zh_per_segment/<unit_id>.zh.md`（覆盖写）。",
         "  4. is_reference=True 的单元位于 References / Bibliography 及其后，已从最终译文中排除，无需翻译。",
-        "- 为了让 `previous_zh_context` 使用上一单元中文译文，建议按索引顺序翻译；如果需要刷新后续 prompt，可在已有译文基础上重新运行 prepare/generate。",
-        "- 全部翻译完后，执行：",
+        "",
+        "## 性能：wave 并行调度（推荐）",
+        "",
+        f"- 共 {total_translatable} 个待翻译单元，共 {max_wave + 1 if max_wave >= 0 else 0} 个 wave；单 wave 最大并行度 = {max_parallel}。",
+        "- 同一 wave 内的单元彼此**没有上下文依赖**，可安全并发调用 LLM；wave 之间必须串行（后面的 wave 需要前一 wave 的 `zh.md` 作为 previous_zh_context）。",
+        "- 推荐实现：",
+        "  ```",
+        "  for wave in sorted(unique_waves):",
+        "      parallel_run(units where unit.wave == wave, concurrency=N)",
+        "  ```",
+        "- 如果宿主不支持并发，也可直接按 `unit_id` 顺序串行翻译，两种策略同等正确。",
+        "",
+        "## 后续步骤",
+        "",
+        "全部翻译完后，执行：",
         "  `python3 translate.py --mode collect --workdir <outdir>` 组装译文。",
         "",
         "## 翻译单元清单",
         "",
-        "| unit_id | segments | section | char_len | is_reference | status |",
-        "|---|---|---|---|---|---|",
+        "| unit_id | wave | segments | section | char_len | is_reference | status |",
+        "|---|---|---|---|---|---|---|",
     ]
 
     for idx, unit in enumerate(units):
         unit_id = unit["id"]
         zh_path = zh_dir / f"{unit_id}.zh.md"
         prompt_path = prompts_dir / f"{unit_id}.prompt.md"
+        wave = unit.get("wave", -1)
+        wave_display = "-" if wave < 0 else str(wave)
 
         if unit.get("is_reference"):
             index_lines.append(
-                f"| {unit_id} | {', '.join(unit['segment_ids'])} | {unit['section_heading']} | {unit['char_len']} | yes | excluded |"
+                f"| {unit_id} | {wave_display} | {', '.join(unit['segment_ids'])} | {unit['section_heading']} | {unit['char_len']} | yes | excluded |"
             )
             continue
 
@@ -295,6 +340,7 @@ def generate(segments_path: Path, outdir: Path, glossary: Dict[str, str],
         )
 
         prompt_md = (
+            f"<!-- wave={wave} unit_id={unit_id} -->\n\n"
             "# SYSTEM\n\n"
             + SYSTEM_PROMPT
             + "\n\n---\n\n# USER\n\n"
@@ -307,10 +353,30 @@ def generate(segments_path: Path, outdir: Path, glossary: Dict[str, str],
 
         status = "done" if zh_path.read_text(encoding="utf-8").strip() else "pending"
         index_lines.append(
-            f"| {unit_id} | {', '.join(unit['segment_ids'])} | {unit['section_heading']} | {unit['char_len']} | no | {status} |"
+            f"| {unit_id} | {wave_display} | {', '.join(unit['segment_ids'])} | {unit['section_heading']} | {unit['char_len']} | no | {status} |"
         )
 
     (outdir / "INDEX.md").write_text("\n".join(index_lines), encoding="utf-8")
+
+    # 额外输出 waves.json，方便外部执行器按 wave 并发调度。
+    waves_map: Dict[str, List[str]] = {}
+    for u in units:
+        if u.get("is_reference"):
+            continue
+        waves_map.setdefault(str(u["wave"]), []).append(u["id"])
+    (outdir / "waves.json").write_text(
+        json.dumps(
+            {
+                "total_units": total_translatable,
+                "num_waves": (max_wave + 1) if max_wave >= 0 else 0,
+                "max_parallel": max_parallel,
+                "waves": {k: waves_map[k] for k in sorted(waves_map, key=lambda x: int(x))},
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _load_units_for_collect(segments_path: Path, outdir: Path) -> List[Dict[str, Any]]:
